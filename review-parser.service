@@ -1,0 +1,66 @@
+# /etc/systemd/system/review-parser.service
+#
+# Install:
+#   sudo cp review-parser.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable review-parser
+#   sudo systemctl start review-parser
+#
+# Useful commands:
+#   sudo systemctl status review-parser
+#   sudo journalctl -u review-parser -f          # live logs
+#   sudo journalctl -u review-parser --since "1h ago"
+#   sudo systemctl restart review-parser
+
+[Unit]
+Description=Review Parser — Yandex.Maps & 2GIS async scraper
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Restart if Postgres wasn't ready yet on first boot
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/review_parser
+
+# Load .env into the process environment so pydantic-settings picks it up
+EnvironmentFile=/home/ubuntu/review_parser/.env
+
+# Full path to the venv interpreter
+ExecStart=/home/ubuntu/review_parser/.venv/bin/python main.py
+
+# Allow browser + DB startup before declaring failure
+TimeoutStartSec=60
+
+# Give the current parse cycle time to finish on SIGTERM
+# Cycle takes ~6-10 min, so 660 s gives a full cycle to complete
+TimeoutStopSec=660
+
+# Send SIGTERM first, then SIGKILL after TimeoutStopSec
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy: on-failure covers crashes and OOM kills
+# Do NOT use "always" — that would restart on clean exit (systemctl stop)
+Restart=on-failure
+RestartSec=10
+
+# Chromium needs /dev/shm; raise the limit (default is often 64 MB on VPS)
+# This maps to the kernel's /dev/shm for the process
+# With --disable-dev-shm-usage the flag is redundant but harmless
+PrivateTmp=false
+
+# Logs go to journald AND to logs/app.log (handled by RotatingFileHandler)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=review-parser
+
+# Resource limits — 4 GB VPS, Chromium + Python + PG pool
+# Chromium: ~300 MB RSS, Python: ~80 MB, PG asyncpg pool: ~20 MB
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

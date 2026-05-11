@@ -1,0 +1,262 @@
+"""
+parsers/two_gis.py — 2GIS review parser.
+
+Inherits scroll/modal/spoiler helpers from BaseParser.
+parse() is decorated with tenacity retry at the CALLER level (see scheduler).
+"""
+from __future__ import annotations
+
+import logging
+import time
+
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+
+from parsers.base import BaseParser
+from parsers.exceptions import NoReviewsFoundException, PageLoadException
+
+logger = logging.getLogger(__name__)
+
+# ── Selectors (single source of truth) ────────────────────────────────────────
+_REVIEW_BLOCK     = "._1rowqpjv"
+_SCROLLABLE_DIV   = "._8hh56jx"
+_EXPAND_BUTTON    = "._1e65qgv"
+_TOTAL_COUNT      = "._4v626nk span, ._46hyo9"
+_FIRST_REVIEW     = _REVIEW_BLOCK  # used for _wait_smart
+
+
+class TwoGisParser(BaseParser):
+
+    def __init__(self, page: Page) -> None:
+        super().__init__(page)
+
+    async def parse(self, url: str) -> list[dict]:
+        """
+        Full 2GIS review scrape.
+
+        Steps:
+          1. Navigate (domcontentloaded — fastest safe option)
+          2. Wait for first review block (smart wait, not blind timeout)
+          3. Dismiss modal if present
+          4. Read total review count
+          5. Smart-scroll until all reviews loaded
+          6. Expand spoilers via single JS evaluate
+          7. Extract all data in one page.evaluate()
+        """
+        t0 = time.monotonic()
+        self._log.info("TwoGisParser.parse: start → %s", url)
+
+        page = self._page
+
+        # ── 1. Navigate ───────────────────────────────────────────────────────
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                break
+            except (PlaywrightTimeoutError, Exception) as exc:
+                self._log.warning("2GIS navigation attempt %d failed: %s", attempt + 1, exc)
+                if attempt == max_retries - 1:
+                    raise PageLoadException(f"2GIS page load failed after {max_retries} attempts: {url}") from exc
+                await page.wait_for_timeout(3000)
+
+        await page.wait_for_timeout(4000)
+
+        # ── 2. Wait for reviews to appear (replaces blind wait_for_timeout) ───
+        appeared = await self._wait_smart(_FIRST_REVIEW, timeout=15_000)
+        if not appeared:
+            # Пробуем альтернативные селекторы 2GIS
+            alt_selectors = [
+                "[class*='_1rowqpjv']", 
+                "[class*='review']", 
+                "._1ggk29z",
+                "[class*='_1f9j']",
+                "[class*='review-card']",
+                "[data-testid='review']",
+                ".reviews-list [class*='item']",
+                "[class*='review-item']"
+            ]
+            
+            for alt in alt_selectors:
+                self._log.info("TwoGisParser: trying alternative selector: %s", alt)
+                appeared = await self._wait_smart(alt, timeout=5_000)
+                if appeared:
+                    self._log.info("TwoGisParser: found reviews with selector: %s", alt)
+                    break
+                    
+            if not appeared:
+                # Проверим может страница просто без отзывов
+                no_reviews_indicators = [
+                    "[class*='no-reviews']",
+                    "[class*='empty']",
+                    "[class*='not-found']",
+                    ".reviews-empty"
+                ]
+                
+                has_no_reviews = False
+                for indicator in no_reviews_indicators:
+                    if await page.query_selector(indicator):
+                        has_no_reviews = True
+                        self._log.info("TwoGisParser: page has no reviews indicator")
+                        break
+                
+                if not has_no_reviews:
+                    # Сделаем скриншот для отладки
+                    try:
+                        await page.screenshot(path=f"debug_2gis_{int(time.time())}.png")
+                        self._log.warning("TwoGisParser: screenshot saved for debugging")
+                    except:
+                        pass
+                
+                raise NoReviewsFoundException(
+                    f"2GIS: no review blocks found at {url}"
+                )
+
+        # ── 3. Dismiss modal ──────────────────────────────────────────────────
+        await self._close_modal_if_exists()
+        
+        # Закрываем специфичные модальные окна 2GIS
+        await self._close_2gis_modals()
+
+    async def _close_2gis_modals(self) -> None:
+        """Закрывает специфичные модальные окна 2GIS: 'Хорошо' и 'Обновление браузера'"""
+        page = self._page  # Используем page из экземпляра класса
+        
+        try:
+            # Закрываем попап "Хорошо"
+            ok_selectors = [
+                '[class*="modal"] button:has-text("Хорошо")',
+                '[class*="popup"] button:has-text("Хорошо")', 
+                'button:has-text("Хорошо")',
+                '.modal button:has-text("Хорошо")'
+            ]
+            
+            for selector in ok_selectors:
+                try:
+                    btn = await page.query_selector(selector, timeout=2000)
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_timeout(500)
+                        self._log.info("TwoGisParser: closed 'Хорошо' modal")
+                        break
+                except:
+                    continue
+            
+            # Закрываем попап "Обновление браузера"
+            skip_selectors = [
+                '[class*="modal"] button:has-text("Пропустить")',
+                '[class*="popup"] button:has-text("Пропустить")',
+                '[class*="modal"] button:has-text("Пропустить обновление")',
+                'button:has-text("Пропустить")',
+                'button:has-text("Пропустить обновление браузера")'
+            ]
+            
+            for selector in skip_selectors:
+                try:
+                    btn = await page.query_selector(selector, timeout=2000)
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_timeout(500)
+                        self._log.info("TwoGisParser: skipped browser update modal")
+                        break
+                except:
+                    continue
+                    
+        except Exception as exc:
+            self._log.debug("TwoGisParser: _close_2gis_modals error: %s", exc)
+
+        # ── 4. Total count ────────────────────────────────────────────────────
+        total: int = await page.evaluate(
+            """
+            () => {
+                const el = document.querySelector('._4v626nk span, ._46hyo9');
+                if (!el) return 0;
+                const m = el.innerText.match(/(\\d+)/);
+                return m ? parseInt(m[1]) : 0;
+            }
+            """
+        )
+        self._log.info("TwoGisParser: total reviews declared = %d", total)
+
+        # ── 5. Smart scroll ───────────────────────────────────────────────────
+        # Try the dedicated scrollable container first; fall back to window.
+        scrollable = await page.query_selector(_SCROLLABLE_DIV)
+        scrollable_sel = _SCROLLABLE_DIV if scrollable else None
+
+        final_count = await self._smart_scroll(
+            scrollable_selector=scrollable_sel,
+            blocks_selector=_REVIEW_BLOCK,
+            max_no_change=3,
+            expected_total=20,
+            scroll_pause_ms=300,
+        )
+        self._log.info("TwoGisParser: %d blocks after scroll", final_count)
+
+        # ── 6. Expand spoilers (one JS call, not a Python loop) ───────────────
+        await self._expand_spoilers(_EXPAND_BUTTON)
+        await page.wait_for_timeout(200)   # let expanded text render
+
+        # ── 7. Extract ────────────────────────────────────────────────────────
+        raw: list[dict] = await page.evaluate(
+            """
+            () => {
+                const reviews = [];
+                const allBlocks = document.querySelectorAll('._1rowqpjv');
+                        const blocks = [...allBlocks].slice(0, 20);
+
+                for (const block of blocks) {
+                    try {
+                        const nameEl = block.querySelector('._19h0cqe');
+                        const author = nameEl ? nameEl.innerText.trim() : 'Anonymous';
+
+                        // Считаем SVG звёзды в контейнере рейтинга
+                        let rating = 0;
+                        const ratingContainer = block.querySelector('._1fkin5c');
+                        if (ratingContainer) {
+                            rating = ratingContainer.querySelectorAll('span').length;
+                        }
+                        // Fallback: старый способ по тексту
+                        if (rating === 0) {
+                            const bodyText = block.innerText;
+                            if      (bodyText.includes('В восторге'))            rating = 5;
+                            else if (bodyText.includes('Понравилось'))           rating = 4;
+                            else if (bodyText.includes('Было средне'))           rating = 3;
+                            else if (bodyText.includes('Не понравилось'))        rating = 2;
+                            else if (bodyText.includes('Совсем не понравилось')) rating = 1;
+                        }
+
+                        let text = '';
+                        const fullContainer = block.querySelector('._83kmcy');
+                        if (fullContainer) {
+                            const inner = fullContainer.querySelector('a, span');
+                            text = (inner && !inner.innerText.includes('Читать целиком'))
+                                ? inner.innerText.trim()
+                                : fullContainer.innerText.trim();
+                        }
+                        text = text.replace('Читать целиком', '').trim();
+
+                        if (!text || text.length < 20) {
+                            const alt = block.querySelector('._oxthv5, ._co8kyiw');
+                            if (alt) text = alt.innerText.replace('Читать целиком', '').trim();
+                        }
+
+                        const dateEl = block.querySelector('._10c0hgu');
+                        const review_date = dateEl ? dateEl.innerText.trim() : '';
+
+                        if (text || rating > 0) {
+                            reviews.push({ author, rating, text, review_date, user_status: null });
+                        }
+                    } catch(e) {}
+                }
+                return reviews;
+            }
+            """
+        )
+
+        # Stamp source field
+        result = [{"source": "2gis", **r} for r in raw]
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        self._log.info(
+            "TwoGisParser.parse: done — %d reviews in %d ms", len(result), duration_ms
+        )
+        return result

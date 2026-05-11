@@ -1,0 +1,31 @@
+# ── Web scraping ──────────────────────────────────────────────────────────────
+playwright==1.44.0          # Async Chromium automation; 1.44 — last stable before API churn
+# install browsers separately: playwright install chromium
+
+# ── Database ──────────────────────────────────────────────────────────────────
+asyncpg==0.29.0             # Native async PostgreSQL driver (no psycopg2 overhead)
+SQLAlchemy==2.0.30          # 2.0 — unified async API, no legacy patterns
+alembic==1.13.1             # Schema migrations that pair with SQLAlchemy 2.0
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+pydantic-settings==2.3.1    # v2 — native .env support, typed validators, no extra deps
+pydantic==2.7.4             # v2 core (pydantic-settings v2 requires pydantic v2)
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+APScheduler==3.10.4         # 3.x asyncio scheduler; v4 is still beta/breaking
+
+# ── Telegram bot ──────────────────────────────────────────────────────────────
+aiogram==3.7.0              # 3.x — fully async, FSM, middleware; 2.x is EOL
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+openai==1.35.3              # v1 — new client interface (AsyncOpenAI), streaming, tools
+
+# ── HTTP (utility) ────────────────────────────────────────────────────────────
+httpx==0.27.0               # Used by openai SDK internally; pin to avoid conflicts
+aiohttp==3.9.5              # Lightweight async HTTP for health-checks / webhooks
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1        # Fallback .env loader (pydantic-settings uses it under the hood)
+tenacity==8.3.0             # Retry logic with exponential backoff for parsers & API calls
+loguru==0.7.2               # Optional pretty logging; stdlib logging used by default
+pytz==2024.1                # Timezone-aware scheduling (APScheduler requires it)
